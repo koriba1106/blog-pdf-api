@@ -1,0 +1,201 @@
+﻿<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Blog Exporter</title>
+    <style>
+        body { 
+            font-family: "Helvetica Neue", Arial, sans-serif; 
+            /* ★修正：背景色を鶯色に */
+            background-color: #918D40; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            min-height: 100vh; /* スマホで縦向きでも中央に配置するためmin-heightに変更 */
+            margin: 0; 
+            padding: 20px; /* 全体にパディングを追加 */
+            box-sizing: border-box; /* パディングを含めたサイズ計算にする */
+        }
+        /* ダウンロード中のカーソル設定 */
+        body.waiting, body.waiting button, body.waiting input {
+            cursor: wait !important;
+        }
+
+        .card { 
+            background: rgba(255, 255, 255, 0.95); /* 背景色に合わせて、少し透過させて洗練された印象に */
+            padding: 40px; 
+            border-radius: 12px; 
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1); 
+            width: 100%; 
+            max-width: 500px; 
+            box-sizing: border-box; /* パディングを含めたサイズ計算にする */
+        }
+        h1 { font-size: 22px; color: #333; margin-bottom: 25px; text-align: center; font-weight: bold; }
+        label { display: block; font-size: 14px; color: #555; margin-bottom: 8px; font-weight: bold; }
+        input { 
+            width: 100%; 
+            padding: 14px; 
+            border: 1px solid #ccc; 
+            border-radius: 6px; 
+            box-sizing: border-box; 
+            margin-bottom: 25px; 
+            font-size: 16px; /* スマホで入力時にズームされないように16px以上に設定 */
+            transition: border-color 0.3s;
+        }
+        input:focus {
+            border-color: #007bff;
+            outline: none;
+        }
+        button { 
+            width: 100%; 
+            padding: 16px; 
+            background: #007bff; 
+            color: white; 
+            border: none; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            font-weight: bold; 
+            font-size: 18px; 
+            transition: background 0.3s, transform 0.1s; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        button:disabled { background: #ccc; cursor: not-allowed; box-shadow: none; transform: none; }
+        
+        #status { 
+            margin-top: 25px; 
+            text-align: center; 
+            color: #666; 
+            font-size: 15px; 
+            display: none; 
+            line-height: 1.6; 
+            padding: 15px; 
+            border-radius: 6px; 
+            background: #f8f9fa;
+            border: 1px solid #eee;
+        }
+        /* 完了時のメッセージ用スタイル */
+        .success-msg { 
+            color: #155724 !important; 
+            font-weight: bold; 
+            background: #d4edda !important; 
+            border-color: #c3e6cb !important;
+        }
+
+        /* ★追加：スマホ対応のためのメディアクエリ */
+        @media (max-width: 600px) {
+            body {
+                padding: 10px; /* 全体のパディングを減らす */
+            }
+            .card {
+                padding: 30px 20px; /* カード内のパディングを減らす */
+                border-radius: 8px;
+            }
+            h1 {
+                font-size: 18px;
+                margin-bottom: 20px;
+            }
+            input {
+                padding: 12px;
+                margin-bottom: 20px;
+                font-size: 14px; /* スマホではフォントサイズを少し小さく */
+            }
+            button {
+                padding: 14px;
+                font-size: 16px;
+            }
+            #status {
+                margin-top: 20px;
+                font-size: 13px;
+                padding: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>武庫ブログ記事をPDF変換</h1>
+        <label for="urlInput">記事のURLを入力</label>
+        <input type="text" id="urlInput" placeholder="https://your-blog.com/post-123" required>
+        <button id="btn">PDFをダウンロード</button>
+        <div id="status">生成中...（30秒から１分程度分かかります</div>
+    </div>
+
+    <script>
+        document.getElementById('btn').onclick = async () => {
+            const urlInput = document.getElementById('urlInput');
+            const url = urlInput.value.trim(); // 空白を除去
+            const btn = document.getElementById('btn');
+            const status = document.getElementById('status');
+            
+            if (!url) {
+                alert('URLを入力してください');
+                urlInput.focus();
+                return;
+            }
+
+            // --- 処理開始時の設定 ---
+            btn.disabled = true;
+            document.body.classList.add('waiting'); // カーソルを砂時計に
+            status.style.display = 'block';
+            status.classList.remove('success-msg');
+            status.innerText = '生成中...（30秒から１分程度分かかります）';
+
+            try {
+                // ★重要：ローカルテスト時は 'http://localhost:3000/api/generate-pdf'
+                // Render公開後は 'https://あなたのサービス名.onrender.com/api/generate-pdf'
+                const response = await fetch('http://localhost:3000/api/generate-pdf', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+
+                if (!response.ok) throw new Error('生成エラー');
+
+                // ファイル名の取得ロジック
+                const disposition = response.headers.get('Content-Disposition');
+                let fileName = 'export.pdf'; // 失敗時のバックアップ
+                
+                if (disposition) {
+                    // 日本語ファイル名(UTF-8)を正しく解読する
+                    const filenameRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/;
+                    const matches = filenameRegex.exec(disposition);
+                    if (matches != null && matches[1]) {
+                        fileName = decodeURIComponent(matches[1].replace(/['"]/g, ''));
+                    }
+                }
+
+                const blob = await response.blob();
+                const downloadUrl = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                window.URL.revokeObjectURL(downloadUrl); // メモリを解放
+
+                // --- 完了時の表示更新 ---
+                status.classList.add('success-msg');
+                status.innerText = `? ダウンロード完了\n${fileName}`;
+
+            } catch (e) {
+                alert('エラーが発生しました');
+                status.style.display = 'none';
+                console.error(e);
+            } finally {
+                // --- 終了時の復元 ---
+                btn.disabled = false;
+                document.body.classList.remove('waiting'); // カーソルを元に戻す
+            }
+        };
+    </script>
+</body>
+</html>
