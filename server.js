@@ -61,7 +61,7 @@ async function generatePdf(targetUrl, imageWidthPercent) {
         await page.evaluate(() => window.scrollTo(0, 0));
         await new Promise(r => setTimeout(r, 2000));
 
-        console.log('PDF整形中（画像サイズ適用）...');
+        console.log('PDF整形中（画像サイズ適用・URL挿入）...');
         
         await page.evaluate((imgMaxPct) => {
             // 不要な要素の削除
@@ -72,10 +72,13 @@ async function generatePdf(targetUrl, imageWidthPercent) {
             const targetWidthPx = (containerW * imgMaxPct) / 100;
 
             document.querySelectorAll('img').forEach(img => {
+                // 遅延読み込み対策
                 if (!img.src && img.dataset.src) img.src = img.dataset.src;
+                const url = img.src;
+                if (!url) return;
 
+                // 画像のサイズ制御
                 const naturalW = img.naturalWidth;
-                
                 if (naturalW > targetWidthPx) {
                     img.style.setProperty('width', 'auto', 'important');
                     img.style.setProperty('max-width', '100%', 'important');
@@ -83,35 +86,65 @@ async function generatePdf(targetUrl, imageWidthPercent) {
                     img.style.setProperty('width', imgMaxPct + '%', 'important');
                     img.style.setProperty('max-width', '100%', 'important');
                 }
-                
                 img.style.setProperty('height', 'auto', 'important');
                 img.style.setProperty('display', 'block', 'important');
-                img.style.setProperty('margin', '10px 0', 'important');
+                img.style.setProperty('margin', '10px 0 2px 0', 'important'); // 下マージンを小さく
                 
                 img.removeAttribute('width');
                 img.removeAttribute('height');
+
+                // --- 写真URLの挿入 ---
+                const urlDiv = document.createElement('div');
+                // classを付けておき、後のCSSリセット対象から除外されやすくする
+                urlDiv.className = 'pdf-image-url';
+                urlDiv.textContent = `[Image URL: ${url}]`;
+                
+                // URL表示用スタイル（非常に小さく、グレーで、長いURLも折り返す）
+                urlDiv.style.cssText = `
+                    font-size: 8px !important;
+                    color: #666 !important;
+                    word-break: break-all !important;
+                    margin-bottom: 15px !important;
+                    line-height: 1.2 !important;
+                    display: block !important;
+                `;
+
+                // 画像がリンク <a> の中にある場合は <a> の後ろに挿入
+                const parent = img.parentNode;
+                const insertTarget = (parent && parent.tagName.toLowerCase() === 'a') ? parent : img;
+                if (insertTarget.parentNode) {
+                    insertTarget.parentNode.insertBefore(urlDiv, insertTarget.nextSibling);
+                }
             });
         }, imageWidthPercent);
 
-        // 基本スタイルの注入（文字化け・CSSテキスト表示の修正）
+        // 基本スタイルの注入
         await page.addStyleTag({
             content: `
-                /* CSSタグ自体がテキストとして表示されるのを防ぐ */
+                /* システム要素を非表示 */
                 head, style, script, noscript, meta, title { display: none !important; }
 
-                /* 本文要素のみレイアウトをリセット */
+                /* 本文要素のレイアウトをリセット */
                 body *, body *::before, body *::after {
                     float: none !important; position: static !important; display: block !important;
                     max-width: 100% !important; background: transparent !important; box-shadow: none !important; border: none !important;
                 }
+                
+                /* インライン要素の保持 */
                 a, span, strong, em, b, i, u, s, label { display: inline !important; }
+                
+                /* URL表示用要素の保護（display: blockを維持） */
+                .pdf-image-url { display: block !important; }
+
                 table { display: table !important; width: 100% !important; border-collapse: collapse !important; }
                 tr { display: table-row !important; }
                 th, td { display: table-cell !important; padding: 6px !important; border: 1px solid #999 !important; }
                 li { display: list-item !important; }
+                
                 html, body { background: #fff !important; color: #000 !important; font-size: 14px !important; display: block !important; }
+                
                 @media print {
-                    p, li, img, tr { page-break-inside: avoid !important; break-inside: avoid !important; }
+                    p, li, img, tr, .pdf-image-url { page-break-inside: avoid !important; break-inside: avoid !important; }
                 }
             `
         });
