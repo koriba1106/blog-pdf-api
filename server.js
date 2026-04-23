@@ -1,7 +1,5 @@
-'use strict';
-
 const express = require('express');
-const cors    = require('cors');
+const cors = require('cors');
 const puppeteer = require('puppeteer');
 const { URL } = require('url');
 
@@ -12,355 +10,386 @@ app.use(express.json());
 // ===================================================
 // 定数
 // ===================================================
-const MAX_CONCURRENT  = 3;
-const PDF_TIMEOUT_MS  = 90_000;   // 90秒
-const SCROLL_TIMEOUT  = 10_000;   // 10秒
-const GOTO_TIMEOUT    = 30_000;   // 30秒（networkidle2 / フォールバック用）
+const MAX_CONCURRENT = 3;      // 同時処理の上限
+const PDF_TIMEOUT_MS = 90000;  // 全体タイムアウト: 90秒
 
 // 同時リクエスト数のカウンター
 let activeRequests = 0;
 
 // ===================================================
 // 🔒 SSRFリスク対策: URLの安全チェック
-//   - IPv4 プライベート／ループバック
-//   - IPv6 ループバック・リンクローカル・IPv4マップドアドレス
-//   - クラウドメタデータエンドポイント
 // ===================================================
-const BLOCKED_HOSTNAME_PATTERNS = [
-    // IPv4
-    /^localhost$/i,
-    /^127\./,
-    /^0\.0\.0\.0$/,
-    /^10\./,
-    /^192\.168\./,
-    /^172\.(1[6-9]|2\d|3[01])\./,
-    /^169\.254\./,                      // リンクローカル (APIPA)
-
-    // IPv6（括弧除去後）
-    /^::1$/,                            // ループバック
-    /^fe80:/i,                          // リンクローカル
-    /^fc00:/i,                          // ユニークローカル
-    /^fd[0-9a-f]{2}:/i,                 // ユニークローカル
-    /^::ffff:127\./i,                   // IPv4マップドループバック
-    /^::ffff:10\./i,                    // IPv4マップドプライベート
-    /^::ffff:192\.168\./i,
-    /^::ffff:172\.(1[6-9]|2\d|3[01])\./i,
-    /^::ffff:169\.254\./i,
-
-    // クラウドメタデータ
-    /^metadata\.google\.internal$/i,    // GCP
-    /^169\.254\.169\.254$/,             // AWS / Azure IMDSv1
-];
-
 function isSafeUrl(urlString) {
-    try {
-        const parsed = new URL(urlString);
+    try {
+        const parsed = new URL(urlString);
 
-        // http / https のみ許可
-        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+        // http / https のみ許可
+        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
 
-        // IPv6アドレスの括弧を除去して正規化
-        const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+        // ローカル・内部アドレスをブロック
+        const blockedPattern = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/;
+        if (blockedPattern.test(parsed.hostname)) return false;
 
-        return !BLOCKED_HOSTNAME_PATTERNS.some(pattern => pattern.test(host));
-    } catch {
-        return false;
-    }
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 // ===================================================
 // 🖱️ 無限スクロール対策つき自動スクロール関数
 // ===================================================
 async function autoScroll(page) {
-    await page.evaluate(async (maxTime) => {
-        await new Promise((resolve) => {
-            let totalHeight = 0;
-            const distance = 100;
-            const start    = Date.now();
+    await page.evaluate(async () => {
+        await new Promise((resolve) => {
+            let totalHeight = 0;
+            const distance = 100;
+            const maxTime = 10000; // 最大10秒でスクロール終了
+            const start = Date.now();
 
-            const timer = setInterval(() => {
-                const scrollHeight = document.body.scrollHeight;
-                window.scrollBy(0, distance);
-                totalHeight += distance;
+            const timer = setInterval(() => {
+                const scrollHeight = document.body.scrollHeight;
+                window.scrollBy(0, distance);
+                totalHeight += distance;
 
-                const reachedBottom = totalHeight >= scrollHeight - window.innerHeight;
-                const timedOut      = Date.now() - start > maxTime;
+                const reachedBottom = totalHeight >= scrollHeight - window.innerHeight;
+                const timedOut = Date.now() - start > maxTime;
 
-                if (reachedBottom || timedOut) {
-                    clearInterval(timer);
-                    resolve();
-                }
-            }, 100);
-        });
-    }, SCROLL_TIMEOUT);
-}
-
-// ===================================================
-// 🛡️ HTML文字列のエスケープ（XSS対策）
-// ===================================================
-function escapeHtml(str) {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+                if (reachedBottom || timedOut) {
+                    clearInterval(timer);
+                    resolve();
+                }
+            }, 100);
+        });
+    });
 }
 
 // ===================================================
 // 📄 PDF生成の本体処理
-//   - タイムアウトは必ず finally でクリア
-//   - ブラウザは必ず finally でクローズ
 // ===================================================
-async function generatePdf(targetUrl) {
-    let browser   = null;
-    let timeoutId = null;
+async function generatePdf(targetUrl, imageWidthPercent) {
+    let browser;
 
-    try {
-        // --------- タイムアウト用 Promise ---------
-        const timeoutPromise = new Promise((_, reject) => {
-            timeoutId = setTimeout(
-                () => reject(new Error(`PDF生成が${PDF_TIMEOUT_MS / 1000}秒を超えたためタイムアウトしました。`)),
-                PDF_TIMEOUT_MS
-            );
-        });
+    try {
+        browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        });
 
-        // --------- PDF生成タスク ---------
-        const pdfTask = async () => {
-            browser = await puppeteer.launch({
-                headless: true,
-                // ⚠️ 本番環境では root ユーザー以外で実行することを推奨
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                ]
-            });
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1200, height: 800 });
 
-            const page = await browser.newPage();
-            await page.setViewport({ width: 1200, height: 800 });
+        console.log('サイトにアクセスしています...');
+        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-            // ---- ページ取得（networkidle2 失敗時は domcontentloaded にフォールバック）----
-            console.log(`[PDF] ページ取得中: ${targetUrl}`);
-            try {
-                await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: GOTO_TIMEOUT });
-            } catch (e) {
-                console.warn('[PDF] networkidle2 タイムアウト。domcontentloaded で再試行します...');
-                await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT });
-            }
+        console.log('画像を読み込むためにスクロールしています...');
+        await autoScroll(page);
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await new Promise(r => setTimeout(r, 2000));
 
-            // ---- スクロールで遅延読み込み画像を展開 ----
-            console.log('[PDF] 自動スクロール中...');
-            await autoScroll(page);
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await new Promise(r => setTimeout(r, 2000));
+        console.log('PDF用にページを整形しています...');
 
-            // ---- 印刷用CSSの注入 ----
-            await page.addStyleTag({
-                content: `
-                    @media print {
-                        p, li, blockquote, figure, table, tr, img, pre, code,
-                        .wp-block-image, .wp-block-group {
-                            page-break-inside: avoid !important;
-                            break-inside:      avoid !important;
-                        }
-                        h1, h2, h3, h4, h5, h6 {
-                            page-break-after:  avoid !important;
-                            break-after:       avoid !important;
-                            page-break-inside: avoid !important;
-                            break-inside:      avoid !important;
-                        }
-                        p, li {
-                            orphans: 2 !important;
-                            widows:  2 !important;
-                        }
-                        * {
-                            max-width:        100% !important;
-                            overflow-wrap:    break-word !important;
-                            word-wrap:        break-word !important;
-                            word-break:       break-word !important;
-                        }
-                        table {
-                            width:        100% !important;
-                            max-width:    100% !important;
-                            table-layout: fixed !important;
-                        }
-                    }
-                `
-            });
+        // 印刷用CSSの注入
+        await page.addStyleTag({
+            content: `
+                /* ===== レイアウトリセット: 段組み・グリッド・フレックスを解除 ===== */
+                *, *::before, *::after {
+                    float: none !important;
+                    position: static !important;
+                    display: block !important;
+                    grid-template-columns: none !important;
+                    grid-template-rows: none !important;
+                    grid-column: auto !important;
+                    grid-row: auto !important;
+                    column-count: 1 !important;
+                    flex-direction: column !important;
+                    max-width: 100% !important;
+                    width: auto !important;
+                    margin-left: 0 !important;
+                    margin-right: 0 !important;
+                    padding-left: 0 !important;
+                    padding-right: 0 !important;
+                    box-sizing: border-box !important;
+                    overflow: visible !important;
+                    /* 背景色・背景画像を除去 */
+                    background: transparent !important;
+                    background-color: transparent !important;
+                    background-image: none !important;
+                    box-shadow: none !important;
+                    text-shadow: none !important;
+                    border: none !important;
+                    outline: none !important;
+                }
 
-            // ---- DOM整形 ----
-            // ※ page.evaluate 内は Puppeteer サンドボックス外なので
-            //    escapeHtml を文字列として渡して再定義する
-            await page.evaluate((escapeHtmlSrc) => {
-                // eslint-disable-next-line no-eval
-                const escapeHtml = eval(`(${escapeHtmlSrc})`);
+                /* インライン要素はインラインのまま許可 */
+                a, span, strong, em, b, i, u, s, small, sup, sub,
+                abbr, cite, code, mark, time, label {
+                    display: inline !important;
+                }
 
-                // fixed / sticky 要素を static に変換
-                document.querySelectorAll('*').forEach(el => {
-                    const pos = window.getComputedStyle(el).position;
-                    if (pos === 'fixed' || pos === 'sticky') {
-                        el.style.setProperty('position', 'static', 'important');
-                    }
-                });
+                /* テーブル系は適切に表示 */
+                table  { display: table  !important; width: 100% !important; border-collapse: collapse !important; }
+                thead  { display: table-header-group !important; }
+                tbody  { display: table-row-group !important; }
+                tfoot  { display: table-footer-group !important; }
+                tr     { display: table-row !important; }
+                th, td { display: table-cell !important; padding: 6px 8px !important; border: 1px solid #999 !important; word-break: break-word !important; }
 
-                // 不要な要素を削除
-                const killSelectors = [
-                    'header', 'footer', 'aside', 'nav',
-                    '[class*="footer" i]', '[id*="footer" i]', '#colophon',
-                    '[class*="sidebar" i]', '[id*="sidebar" i]', '.widget-area', '[class*="widget" i]',
-                    '[class*="banner" i]', '[id*="banner" i]',
-                    '[class*="ads" i]', '.adsbygoogle', '[class*="advert" i]', '[class*="sponsor" i]',
-                    '[class*="comment" i]', '[id*="comment" i]',
-                    '[class*="share" i]', '[class*="social" i]', '[class*="sns" i]',
-                    '[class*="related" i]', '[class*="pagination" i]',
-                    '[class*="author" i]', '[class*="popup" i]', '[class*="modal" i]', '[class*="overlay" i]'
-                ].join(',');
+                /* ul/ol は list-item で */
+                li { display: list-item !important; }
 
-                document.querySelectorAll(killSelectors).forEach(el => {
-                    const tag = el.tagName.toLowerCase();
-                    const id  = (el.id || '').toLowerCase();
-                    const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+                /* body / html */
+                html, body {
+                    width: 100% !important;
+                    background: #ffffff !important;
+                    color: #000000 !important;
+                    font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", sans-serif !important;
+                    font-size: 14px !important;
+                    line-height: 1.7 !important;
+                }
 
-                    // 本文コンテナは保護
-                    if (
-                        ['body', 'html', 'main', 'article'].includes(tag) ||
-                        ['content', 'main', 'page'].includes(id)          ||
-                        cls.includes('site-main')                          ||
-                        cls.includes('entry-content')                      ||
-                        cls.includes('post-content')
-                    ) return;
+                /* 見出し */
+                h1 { font-size: 22px !important; font-weight: bold !important; margin: 16px 0 8px !important; color: #000 !important; }
+                h2 { font-size: 18px !important; font-weight: bold !important; margin: 14px 0 7px !important; color: #000 !important; }
+                h3 { font-size: 16px !important; font-weight: bold !important; margin: 12px 0 6px !important; color: #000 !important; }
+                h4, h5, h6 { font-size: 14px !important; font-weight: bold !important; margin: 10px 0 5px !important; color: #000 !important; }
 
-                    el.remove();
-                });
+                /* 段落・リスト */
+                p  { margin: 0 0 10px !important; }
+                ul, ol { padding-left: 20px !important; margin: 0 0 10px !important; }
+                blockquote {
+                    margin: 10px 0 10px 10px !important;
+                    padding-left: 12px !important;
+                    border-left: 3px solid #aaa !important;
+                    color: #444 !important;
+                    font-style: italic !important;
+                }
 
-                // 動画を URL テキストに置換（XSS対策: innerHTML 不使用）
-                document.querySelectorAll('iframe[src*="youtube"], iframe[src*="vimeo"], video').forEach(vid => {
-                    const rawUrl = vid.src || vid.currentSrc || 'URL不明';
+                /* コードブロック */
+                pre, code {
+                    font-family: monospace !important;
+                    white-space: pre-wrap !important;
+                    word-break: break-all !important;
+                }
+                pre {
+                    background: #f4f4f4 !important;
+                    padding: 10px !important;
+                    border: 1px solid #ddd !important;
+                    border-radius: 4px !important;
+                    margin: 10px 0 !important;
+                }
 
-                    const wrapper = document.createElement('div');
-                    wrapper.style.cssText = 'padding:10px;border:1px solid #ccc;background:#f9f9f9;margin-bottom:10px;';
+                /* 画像 */
+                img {
+                    max-width: ${imageWidthPercent}% !important;
+                    height: auto !important;
+                    display: block !important;
+                    margin: 10px 0 !important;
+                }
 
-                    const label = document.createElement('strong');
-                    label.textContent = '【動画】';
+                /* リンク */
+                a { color: #0000EE !important; text-decoration: underline !important; word-break: break-all !important; }
 
-                    const urlSpan = document.createElement('span');
-                    urlSpan.style.wordBreak = 'break-all';
-                    urlSpan.textContent = rawUrl; // textContent でエスケープ済み
+                /* 改ページ制御 */
+                @media print {
+                    h1, h2, h3, h4, h5, h6 {
+                        page-break-after: avoid !important;
+                        break-after: avoid !important;
+                    }
+                    p, li, blockquote, img, pre, table, tr {
+                        page-break-inside: avoid !important;
+                        break-inside: avoid !important;
+                    }
+                    p, li { orphans: 2 !important; widows: 2 !important; }
+                }
+            `
+        });
 
-                    wrapper.appendChild(label);
-                    wrapper.appendChild(document.createElement('br'));
-                    wrapper.appendChild(urlSpan);
+        // DOM操作
+        await page.evaluate((imgMaxPct) => {
+            // ===== 不要な要素を削除 =====
+            const killSelectors = [
+                'header', 'footer', 'aside', 'nav',
+                '[class*="footer" i]', '[id*="footer" i]', '#colophon',
+                '[class*="sidebar" i]', '[id*="sidebar" i]', '.widget-area', '[class*="widget" i]',
+                '[class*="banner" i]', '[id*="banner" i]',
+                '[class*="ads" i]', '.adsbygoogle', '[class*="advert" i]', '[class*="sponsor" i]',
+                '[class*="comment" i]', '[id*="comment" i]',
+                '[class*="share" i]', '[class*="social" i]', '[class*="sns" i]',
+                '[class*="related" i]', '[class*="pagination" i]',
+                '[class*="author" i]', '[class*="popup" i]', '[class*="modal" i]', '[class*="overlay" i]',
+                'script', 'style', 'noscript', 'svg', 'canvas',
+                '[class*="breadcrumb" i]', '[class*="tag" i]', '[class*="category" i]',
+                '[class*="menu" i]', '[id*="menu" i]',
+                '[class*="toc" i]', '[id*="toc" i]',
+                '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+                'form', 'button', 'input', 'select', 'textarea'
+            ].join(',');
 
-                    vid.parentNode.replaceChild(wrapper, vid);
-                });
+            document.querySelectorAll(killSelectors).forEach(el => {
+                const tag = el.tagName.toLowerCase();
+                const id = el.id ? el.id.toLowerCase() : '';
+                const cls = el.className && typeof el.className === 'string' ? el.className.toLowerCase() : '';
 
-                // 画像のサイズ制限と URL 表示
-                document.querySelectorAll('img').forEach(img => {
-                    if (img.width < 50 || img.height < 50) return;
+                // 本文コンテナは保護する
+                if (
+                    ['body', 'html', 'main', 'article'].includes(tag) ||
+                    ['content', 'main', 'page'].includes(id) ||
+                    cls.includes('site-main') ||
+                    cls.includes('entry-content') ||
+                    cls.includes('post-content') ||
+                    cls.includes('article-body') ||
+                    cls.includes('article-content')
+                ) return;
 
-                    img.style.setProperty('max-width', '40%',   'important');
-                    img.style.setProperty('width',     'auto',   'important');
-                    img.style.setProperty('height',    'auto',   'important');
-                    img.style.setProperty('display',   'block',  'important');
+                el.remove();
+            });
 
-                    const rawUrl = img.src || img.getAttribute('data-src');
-                    if (!rawUrl) return;
+            // ===== インラインスタイルを全て除去（CSS注入が優先されるようにするため） =====
+            document.querySelectorAll('*').forEach(el => {
+                el.removeAttribute('style');
+                el.removeAttribute('bgcolor');
+                el.removeAttribute('color');
+                el.removeAttribute('background');
+                el.removeAttribute('align');
+                el.removeAttribute('valign');
+                el.removeAttribute('width');
+                el.removeAttribute('height');
+            });
 
-                    const urlDiv = document.createElement('div');
-                    urlDiv.style.cssText = 'font-size:10px;color:#555;word-break:break-all;margin-top:2px;margin-bottom:15px;';
-                    urlDiv.textContent = `画像URL: ${rawUrl}`; // textContent でエスケープ済み
+            // ===== 動画をURLテキストに置換 =====
+            document.querySelectorAll('iframe[src*="youtube"], iframe[src*="vimeo"], video').forEach(vid => {
+                const url = vid.src || vid.currentSrc || 'URL不明';
+                const textNode = document.createElement('div');
+                textNode.style.cssText = 'padding:10px;border:1px solid #ccc;margin-bottom:10px;';
+                textNode.innerHTML = `<strong>【動画】</strong><br><span>${url}</span>`;
+                vid.parentNode && vid.parentNode.replaceChild(textNode, vid);
+            });
 
-                    const anchor = img.parentNode?.tagName?.toLowerCase() === 'a' ? img.parentNode : img;
-                    anchor.parentNode?.insertBefore(urlDiv, anchor.nextSibling);
-                });
+            // ===== 残ったiframeを削除 =====
+            document.querySelectorAll('iframe').forEach(el => el.remove());
 
-            }, escapeHtml.toString()); // escapeHtml を文字列として渡す（今回は textContent で代替済み）
+            // ===== 画像処理: 元サイズより小さい倍率指定の場合は元サイズを保持 =====
+            document.querySelectorAll('img').forEach(img => {
+                // 表示上の幅を取得（naturalWidth も参考に）
+                const naturalW = img.naturalWidth || 0;
+                const containerW = document.body.clientWidth || 800;
+                const maxPxFromPercent = containerW * imgMaxPct / 100;
 
-            // ---- フォント待機 ----
-            console.log('[PDF] フォント読み込み待機中...');
-            await page.evaluateHandle('document.fonts.ready');
-            await new Promise(r => setTimeout(r, 1000));
+                // 元画像が指定倍率より小さい場合はそのまま（縮小しない）
+                const finalMaxPx = (naturalW > 0 && naturalW < maxPxFromPercent)
+                    ? naturalW
+                    : maxPxFromPercent;
 
-            // ---- ページタイトル取得・サニタイズ ----
-            let pageTitle = (await page.title()) || 'document';
-            pageTitle = pageTitle
-                .replace(/[\\/:*?"<>|]/g, '_')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .substring(0, 50);
+                img.style.cssText = `
+                    max-width: ${finalMaxPx}px !important;
+                    width: auto !important;
+                    height: auto !important;
+                    display: block !important;
+                    margin: 10px 0 !important;
+                `;
 
-            // ---- PDF生成 ----
-            await page.emulateMediaType('screen');
-            console.log('[PDF] PDF生成中...');
-            const pdfBuffer = await page.pdf({
-                format: 'A4',
-                printBackground: true,
-                margin: { top: '15mm', right: '15mm', bottom: '15mm', left: '15mm' }
-            });
+                // 画像URL表示
+                const url = img.src || img.getAttribute('data-src');
+                if (!url) return;
 
-            return { pdfBuffer, pageTitle };
-        };
+                const urlDiv = document.createElement('div');
+                urlDiv.style.cssText = 'font-size:10px;color:#555;word-break:break-all;margin-bottom:15px;';
+                urlDiv.textContent = `画像URL: ${url}`;
 
-        // タイムアウトと PDF タスクを競合させる
-        // ★ Promise.race はここ（generatePdf 内）に置く
-        //    → finally が必ず実行されブラウザが確実にクローズされる
-        return await Promise.race([pdfTask(), timeoutPromise]);
+                const parent = img.parentNode;
+                if (parent) {
+                    const insertAfter = (parent.tagName && parent.tagName.toLowerCase() === 'a')
+                        ? parent
+                        : img;
+                    insertAfter.parentNode && insertAfter.parentNode.insertBefore(urlDiv, insertAfter.nextSibling);
+                }
+            });
 
-    } finally {
-        // タイムアウトタイマーを必ずクリア
-        if (timeoutId) clearTimeout(timeoutId);
-        // ブラウザを必ずクローズ（エラー・タイムアウト問わず）
-        if (browser) {
-            console.log('[PDF] ブラウザを終了します...');
-            await browser.close().catch(e => console.error('[PDF] ブラウザ終了エラー:', e.message));
-        }
-    }
+            // ===== lazy-load 画像の src 復元 =====
+            document.querySelectorAll('img[data-src]').forEach(img => {
+                if (!img.src && img.dataset.src) img.src = img.dataset.src;
+            });
+
+        }, imageWidthPercent);
+
+        console.log('フォントの読み込み待機...');
+        await page.evaluateHandle('document.fonts.ready');
+        await new Promise(r => setTimeout(r, 1000));
+
+        let pageTitle = await page.title();
+        if (!pageTitle) pageTitle = 'document';
+        pageTitle = pageTitle.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().substring(0, 50);
+
+        await page.emulateMediaType('print');
+
+        console.log('PDFデータを生成中...');
+        const pdfBuffer = await page.pdf({
+            format: 'A4',
+            printBackground: false,
+            margin: { top: '15mm', right: '15mm', bottom: '15mm', left: '15mm' }
+        });
+
+        return { pdfBuffer, pageTitle };
+
+    } finally {
+        if (browser) await browser.close();
+    }
 }
 
 // ===================================================
-// ❤️ ヘルスチェックエンドポイント
-// ===================================================
-app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', activeRequests });
-});
-
-// ===================================================
-// 🚀 PDF生成 APIエンドポイント
+// 🚀 APIエンドポイント
 // ===================================================
 app.post('/api/generate-pdf', async (req, res) => {
-    const targetUrl = req.body?.url;
+    const targetUrl = req.body.url;
 
-    if (!targetUrl) {
-        return res.status(400).json({ error: 'URLが指定されていません。' });
-    }
+    // imageWidthPercent: 20〜100の整数（5刻み）、デフォルト40
+    let imageWidthPercent = parseInt(req.body.imageWidthPercent, 10);
+    if (isNaN(imageWidthPercent) || imageWidthPercent < 20 || imageWidthPercent > 100) {
+        imageWidthPercent = 40;
+    }
+    // 5刻みに丸める
+    imageWidthPercent = Math.round(imageWidthPercent / 5) * 5;
 
-    if (!isSafeUrl(targetUrl)) {
-        return res.status(400).json({ error: '無効なURLです。外部のhttp/https URLのみ指定できます。' });
-    }
+    // URLの存在チェック
+    if (!targetUrl) {
+        return res.status(400).send({ error: 'URLが指定されていません。' });
+    }
 
-    if (activeRequests >= MAX_CONCURRENT) {
-        return res.status(429).json({ error: 'サーバーが混雑しています。しばらくしてから再試行してください。' });
-    }
+    // SSRFリスク対策
+    if (!isSafeUrl(targetUrl)) {
+        return res.status(400).send({ error: '無効なURLです。外部のhttp/httpsURLのみ指定できます。' });
+    }
 
-    activeRequests++;
-    console.log(`[API] リクエスト受信 [同時処理数: ${activeRequests}]: ${targetUrl}`);
+    // 同時接続数の制限
+    if (activeRequests >= MAX_CONCURRENT) {
+        return res.status(429).send({ error: 'サーバーが混雑しています。しばらくしてから再試行してください。' });
+    }
 
-    try {
-        const { pdfBuffer, pageTitle } = await generatePdf(targetUrl);
+    activeRequests++;
+    console.log(`リクエスト受信 [同時処理数: ${activeRequests}] [画像幅: ${imageWidthPercent}%]: ${targetUrl}`);
 
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(pageTitle)}.pdf"`);
-        res.send(pdfBuffer);
+    try {
+        // 全体タイムアウト (90秒)
+        const { pdfBuffer, pageTitle } = await Promise.race([
+            generatePdf(targetUrl, imageWidthPercent),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('PDF生成がタイムアウトしました。')), PDF_TIMEOUT_MS)
+            )
+        ]);
 
-        console.log(`[API] 完了: ${pageTitle}`);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(pageTitle)}.pdf"`);
+        res.send(pdfBuffer);
 
-    } catch (error) {
-        console.error('[API] エラー:', error.message);
-        res.status(500).json({ error: error.message || 'PDFの生成中にエラーが発生しました。' });
-    } finally {
-        activeRequests--;
-    }
+        console.log(`完了: クライアントにPDFを返却しました。[${pageTitle}]`);
+
+    } catch (error) {
+        console.error('エラー発生:', error.message);
+        res.status(500).send({ error: error.message || 'PDFの生成中にエラーが発生しました。' });
+    } finally {
+        activeRequests--;
+    }
 });
 
 // ===================================================
@@ -368,5 +397,5 @@ app.post('/api/generate-pdf', async (req, res) => {
 // ===================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Server] ポート ${PORT} で起動しました。`);
+    console.log(`APIサーバーがポート ${PORT} で起動しました。`);
 });
