@@ -61,10 +61,10 @@ async function generatePdf(targetUrl, imageWidthPercent) {
         await page.evaluate(() => window.scrollTo(0, 0));
         await new Promise(r => setTimeout(r, 2000));
 
-        console.log('PDF整形中（画像サイズ適用・URL挿入）...');
+        console.log('PDF整形中（画像サイズ・URL表示・改行調整）...');
         
         await page.evaluate((imgMaxPct) => {
-            // 不要な要素の削除
+            // 不要要素の削除
             const killSelectors = 'header,footer,aside,nav,script,style,iframe,form,button,.adsbygoogle';
             document.querySelectorAll(killSelectors).forEach(el => el.remove());
 
@@ -72,12 +72,11 @@ async function generatePdf(targetUrl, imageWidthPercent) {
             const targetWidthPx = (containerW * imgMaxPct) / 100;
 
             document.querySelectorAll('img').forEach(img => {
-                // 遅延読み込み対策
                 if (!img.src && img.dataset.src) img.src = img.dataset.src;
                 const url = img.src;
                 if (!url) return;
 
-                // 画像のサイズ制御
+                // 画像サイズの制御
                 const naturalW = img.naturalWidth;
                 if (naturalW > targetWidthPx) {
                     img.style.setProperty('width', 'auto', 'important');
@@ -88,28 +87,28 @@ async function generatePdf(targetUrl, imageWidthPercent) {
                 }
                 img.style.setProperty('height', 'auto', 'important');
                 img.style.setProperty('display', 'block', 'important');
-                img.style.setProperty('margin', '10px 0 2px 0', 'important'); // 下マージンを小さく
+                img.style.setProperty('margin', '10px 0 2px 0', 'important');
                 
                 img.removeAttribute('width');
                 img.removeAttribute('height');
 
-                // --- 写真URLの挿入 ---
+                // --- 写真URLと強制改行用のコンテナ ---
                 const urlDiv = document.createElement('div');
-                // classを付けておき、後のCSSリセット対象から除外されやすくする
                 urlDiv.className = 'pdf-image-url';
                 urlDiv.textContent = `[Image URL: ${url}]`;
                 
-                // URL表示用スタイル（非常に小さく、グレーで、長いURLも折り返す）
+                // スタイル設定：display: block と clear: both で確実に改行させ、margin-bottom で空白行を作る
                 urlDiv.style.cssText = `
                     font-size: 8px !important;
                     color: #666 !important;
                     word-break: break-all !important;
-                    margin-bottom: 15px !important;
+                    margin-top: 0 !important;
+                    margin-bottom: 24px !important; /* 数値（px）を大きくすることで広い改行（空白行）になります */
                     line-height: 1.2 !important;
                     display: block !important;
+                    clear: both !important; /* 回り込みを強制解除 */
                 `;
 
-                // 画像がリンク <a> の中にある場合は <a> の後ろに挿入
                 const parent = img.parentNode;
                 const insertTarget = (parent && parent.tagName.toLowerCase() === 'a') ? parent : img;
                 if (insertTarget.parentNode) {
@@ -121,20 +120,20 @@ async function generatePdf(targetUrl, imageWidthPercent) {
         // 基本スタイルの注入
         await page.addStyleTag({
             content: `
-                /* システム要素を非表示 */
                 head, style, script, noscript, meta, title { display: none !important; }
 
-                /* 本文要素のレイアウトをリセット */
                 body *, body *::before, body *::after {
                     float: none !important; position: static !important; display: block !important;
                     max-width: 100% !important; background: transparent !important; box-shadow: none !important; border: none !important;
                 }
                 
-                /* インライン要素の保持 */
                 a, span, strong, em, b, i, u, s, label { display: inline !important; }
                 
-                /* URL表示用要素の保護（display: blockを維持） */
-                .pdf-image-url { display: block !important; }
+                /* URL表示用クラスは block 指定を優先し、改行を維持 */
+                .pdf-image-url { 
+                    display: block !important; 
+                    clear: both !important;
+                }
 
                 table { display: table !important; width: 100% !important; border-collapse: collapse !important; }
                 tr { display: table-row !important; }
