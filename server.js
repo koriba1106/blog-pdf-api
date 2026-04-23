@@ -63,7 +63,6 @@ async function generatePdf(targetUrl, imageWidthPercent) {
 
         console.log('PDF整形中（画像サイズ適用）...');
         
-        // CSSとDOM操作を組み合わせて画像サイズを厳密に制御
         await page.evaluate((imgMaxPct) => {
             // 不要な要素の削除
             const killSelectors = 'header,footer,aside,nav,script,style,iframe,form,button,.adsbygoogle';
@@ -73,17 +72,14 @@ async function generatePdf(targetUrl, imageWidthPercent) {
             const targetWidthPx = (containerW * imgMaxPct) / 100;
 
             document.querySelectorAll('img').forEach(img => {
-                // 遅延読み込み対策
                 if (!img.src && img.dataset.src) img.src = img.dataset.src;
 
                 const naturalW = img.naturalWidth;
                 
                 if (naturalW > targetWidthPx) {
-                    // 元画像が指定割合のサイズより大きい場合：元のサイズを維持（ただしページ幅に収める）
                     img.style.setProperty('width', 'auto', 'important');
                     img.style.setProperty('max-width', '100%', 'important');
                 } else {
-                    // それ以外：指定された割合にサイズを固定
                     img.style.setProperty('width', imgMaxPct + '%', 'important');
                     img.style.setProperty('max-width', '100%', 'important');
                 }
@@ -92,16 +88,19 @@ async function generatePdf(targetUrl, imageWidthPercent) {
                 img.style.setProperty('display', 'block', 'important');
                 img.style.setProperty('margin', '10px 0', 'important');
                 
-                // インラインスタイルの干渉を防ぐ
                 img.removeAttribute('width');
                 img.removeAttribute('height');
             });
         }, imageWidthPercent);
 
-        // 基本スタイルの注入
+        // 基本スタイルの注入（文字化け・CSSテキスト表示の修正）
         await page.addStyleTag({
             content: `
-                *, *::before, *::after {
+                /* CSSタグ自体がテキストとして表示されるのを防ぐ */
+                head, style, script, noscript, meta, title { display: none !important; }
+
+                /* 本文要素のみレイアウトをリセット */
+                body *, body *::before, body *::after {
                     float: none !important; position: static !important; display: block !important;
                     max-width: 100% !important; background: transparent !important; box-shadow: none !important; border: none !important;
                 }
@@ -110,7 +109,7 @@ async function generatePdf(targetUrl, imageWidthPercent) {
                 tr { display: table-row !important; }
                 th, td { display: table-cell !important; padding: 6px !important; border: 1px solid #999 !important; }
                 li { display: list-item !important; }
-                html, body { background: #fff !important; color: #000 !important; font-size: 14px !important; }
+                html, body { background: #fff !important; color: #000 !important; font-size: 14px !important; display: block !important; }
                 @media print {
                     p, li, img, tr { page-break-inside: avoid !important; break-inside: avoid !important; }
                 }
@@ -140,11 +139,9 @@ app.post('/api/generate-pdf', async (req, res) => {
     const targetUrl = req.body.url;
     let imageWidthPercent = parseInt(req.body.imageWidthPercent, 10);
 
-    // バリデーション: 30%〜100%の範囲
     if (isNaN(imageWidthPercent) || imageWidthPercent < 30 || imageWidthPercent > 100) {
         imageWidthPercent = 40;
     }
-    // 5%刻みに丸める
     imageWidthPercent = Math.round(imageWidthPercent / 5) * 5;
 
     if (!targetUrl || !isSafeUrl(targetUrl)) {
