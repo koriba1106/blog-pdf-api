@@ -7,8 +7,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const MAX_CONCURRENT = 1;      // 無料プランのリソース制限を考慮し1に設定
-const PDF_TIMEOUT_MS = 120000; // 全体タイムアウトを120秒に延長
+const MAX_CONCURRENT = 1;
+const PDF_TIMEOUT_MS = 120000;
 
 let activeRequests = 0;
 
@@ -21,25 +21,22 @@ function isSafeUrl(urlString) {
     } catch { return false; }
 }
 
-// 高速化したスクロール関数
 async function autoScroll(page) {
     await page.evaluate(async () => {
         await new Promise((resolve) => {
             let totalHeight = 0;
-            const distance = 400; // 一度のスクロール量を増やして高速化
-            const maxTime = 8000; // 最大8秒で切り上げ
+            const distance = 400;
+            const maxTime = 8000;
             const start = Date.now();
-
             const timer = setInterval(() => {
                 const scrollHeight = document.body.scrollHeight;
                 window.scrollBy(0, distance);
                 totalHeight += distance;
-
                 if (totalHeight >= scrollHeight - window.innerHeight || Date.now() - start > maxTime) {
                     clearInterval(timer);
                     resolve();
                 }
-            }, 150); // 間隔を少し広げてCPU負荷を軽減
+            }, 150);
         });
     });
 }
@@ -53,27 +50,60 @@ async function generatePdf(targetUrl, imageWidthPercent) {
         });
 
         const page = await browser.newPage();
-        // 個別のナビゲーションタイムアウトを設定
         page.setDefaultNavigationTimeout(90000); 
         await page.setViewport({ width: 1200, height: 800 });
 
         console.log('サイトにアクセス中...');
-        // networkidle2だと画像が多い場合に終わらないため、DOMContentLoadedで進める
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
 
         console.log('スクロール実行中...');
         await autoScroll(page);
         await page.evaluate(() => window.scrollTo(0, 0));
-        await new Promise(r => setTimeout(r, 2000)); // 画像のレンダリング待ち
+        await new Promise(r => setTimeout(r, 2000));
 
-        console.log('PDF整形中...');
-        // CSS注入
+        console.log('PDF整形中（画像サイズ適用）...');
+        
+        // CSSとDOM操作を組み合わせて画像サイズを厳密に制御
+        await page.evaluate((imgMaxPct) => {
+            // 不要な要素の削除
+            const killSelectors = 'header,footer,aside,nav,script,style,iframe,form,button,.adsbygoogle';
+            document.querySelectorAll(killSelectors).forEach(el => el.remove());
+
+            const containerW = document.documentElement.clientWidth || 1200;
+            const targetWidthPx = (containerW * imgMaxPct) / 100;
+
+            document.querySelectorAll('img').forEach(img => {
+                // 遅延読み込み対策
+                if (!img.src && img.dataset.src) img.src = img.dataset.src;
+
+                const naturalW = img.naturalWidth;
+                
+                if (naturalW > targetWidthPx) {
+                    // 元画像が指定割合のサイズより大きい場合：元のサイズを維持（ただしページ幅に収める）
+                    img.style.setProperty('width', 'auto', 'important');
+                    img.style.setProperty('max-width', '100%', 'important');
+                } else {
+                    // それ以外：指定された割合にサイズを固定
+                    img.style.setProperty('width', imgMaxPct + '%', 'important');
+                    img.style.setProperty('max-width', '100%', 'important');
+                }
+                
+                img.style.setProperty('height', 'auto', 'important');
+                img.style.setProperty('display', 'block', 'important');
+                img.style.setProperty('margin', '10px 0', 'important');
+                
+                // インラインスタイルの干渉を防ぐ
+                img.removeAttribute('width');
+                img.removeAttribute('height');
+            });
+        }, imageWidthPercent);
+
+        // 基本スタイルの注入
         await page.addStyleTag({
             content: `
                 *, *::before, *::after {
                     float: none !important; position: static !important; display: block !important;
-                    max-width: 100% !important; width: auto !important;
-                    background: transparent !important; box-shadow: none !important; border: none !important;
+                    max-width: 100% !important; background: transparent !important; box-shadow: none !important; border: none !important;
                 }
                 a, span, strong, em, b, i, u, s, label { display: inline !important; }
                 table { display: table !important; width: 100% !important; border-collapse: collapse !important; }
@@ -81,30 +111,17 @@ async function generatePdf(targetUrl, imageWidthPercent) {
                 th, td { display: table-cell !important; padding: 6px !important; border: 1px solid #999 !important; }
                 li { display: list-item !important; }
                 html, body { background: #fff !important; color: #000 !important; font-size: 14px !important; }
-                img { max-width: ${imageWidthPercent}% !important; height: auto !important; display: block !important; margin: 10px 0 !important; }
                 @media print {
                     p, li, img, tr { page-break-inside: avoid !important; break-inside: avoid !important; }
                 }
             `
         });
 
-        // DOM操作（不要要素削除・遅延読み込み画像復元）
-        await page.evaluate((imgMaxPct) => {
-            const killSelectors = 'header,footer,aside,nav,script,style,iframe,form,button,.adsbygoogle';
-            document.querySelectorAll(killSelectors).forEach(el => el.remove());
-            
-            document.querySelectorAll('img').forEach(img => {
-                if (!img.src && img.dataset.src) img.src = img.dataset.src;
-                img.removeAttribute('style');
-            });
-        }, imageWidthPercent);
-
         let pageTitle = (await page.title() || 'document')
             .replace(/[\\/:*?"<>|]/g, '_').trim().substring(0, 50);
 
         await page.emulateMediaType('print');
 
-        console.log('PDFバイナリ生成中...');
         return {
             pdfBuffer: await page.pdf({
                 format: 'A4',
@@ -121,7 +138,14 @@ async function generatePdf(targetUrl, imageWidthPercent) {
 
 app.post('/api/generate-pdf', async (req, res) => {
     const targetUrl = req.body.url;
-    let imageWidthPercent = parseInt(req.body.imageWidthPercent, 10) || 40;
+    let imageWidthPercent = parseInt(req.body.imageWidthPercent, 10);
+
+    // バリデーション: 30%〜100%の範囲
+    if (isNaN(imageWidthPercent) || imageWidthPercent < 30 || imageWidthPercent > 100) {
+        imageWidthPercent = 40;
+    }
+    // 5%刻みに丸める
+    imageWidthPercent = Math.round(imageWidthPercent / 5) * 5;
 
     if (!targetUrl || !isSafeUrl(targetUrl)) {
         return res.status(400).send({ error: '有効なURLを指定してください。' });
@@ -146,7 +170,6 @@ app.post('/api/generate-pdf', async (req, res) => {
         activeRequests--;
     }
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
